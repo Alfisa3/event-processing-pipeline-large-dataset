@@ -9,14 +9,15 @@ def read_events(file_path: Path):
             return json.load(file)
 
     if file_path.suffix.lower() == ".csv":
-        with file_path.open("r", encoding="utf-8", newline="") as file:
-            return list(csv.DictReader(file))
+        with file_path.open(
+            "r",
+            encoding="utf-8",
+            newline="",
+        ) as file:
+            reader = csv.DictReader(file)
+
+            yield from reader
+
+        return
 
     raise ValueError("Unsupported file format")
-
-
-if __name__ == "__main__":
-    file_path = Path("data/input/events.json")
-    events = read_events(file_path)
-
-    print(events)

@@ -1,130 +1,347 @@
+
+import csv
+import hashlib
+import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
-from event_pipeline.analytics import (
-    get_events_by_source,
-    get_events_by_type,
-    get_hourly_activity,
-    get_top_active_users,
-    get_total_events,
-    get_total_purchases,
-    get_unique_users,
-)
-from event_pipeline.database import create_database, insert_events
-from event_pipeline.deduplicator import remove_duplicates
 from event_pipeline.logger import setup_logger
-from event_pipeline.reader import read_events
 from event_pipeline.reporter import save_csv_report, save_report
 from event_pipeline.validator import validate_event
 
+BATCH_SIZE = 10_000
 
-def main():
-    logger = setup_logger()
-    logger.info("Pipeline started")
+REQUIRED_COLUMNS = {
+    "event_time",
+    "event_type",
+    "product_id",
+    "category_id",
+    "category_code",
+    "brand",
+    "price",
+    "user_id",
+    "user_session",
+}
 
-    start_time = time.perf_counter()
 
-    # input_path = Path("data/input/events.csv")
-    if len(sys.argv) != 2:
-        raise SystemExit(
-           "Usage: uv run python src\\event_pipeline\\main.py <input_file>"
+def generate_event_id(row: dict[str, Any]) -> str:
+    """Create a stable ID because the Kaggle dataset has no event_id."""
+    normalized_row = {
+        key: "" if value is None else str(value).strip()
+        for key, value in row.items()
+    }
+    row_json = json.dumps(
+        normalized_row,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
+    return hashlib.sha256(row_json.encode("utf-8")).hexdigest()
 
-    input_path = Path(sys.argv[1])
-    database_path = Path("data/events.db")
-    output_path = Path("data/output/report.json")
-    csv_output_path = Path("data/output/report.csv")
 
-    # 1. Read events
-    data = read_events(input_path)
-    records_received = len(data)
+def read_events(input_path: Path):
+    """Read CSV rows or records from a JSON array."""
+    if input_path.suffix.lower() == ".csv":
+        with input_path.open(
+            "r", encoding="utf-8-sig", newline=""
+        ) as file:
+            reader = csv.DictReader(file)
 
-    logger.info("Records received: %s", records_received)
+            if not reader.fieldnames or not REQUIRED_COLUMNS.issubset(
+                set(reader.fieldnames)
+            ):
+                raise ValueError(
+                    "CSV headers do not match the expected Kaggle columns"
+                )
 
-    # 2. Validate events
-    valid_events = []
-    invalid = 0
+            yield from reader
 
-    for item in data:
-        event, error = validate_event(item)
+    elif input_path.suffix.lower() == ".json":
+        with input_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
 
-        if event:
-            valid_events.append(event)
-        else:
-            invalid += 1
-            logger.error(
-                "Invalid event: %s | Error: %s",
-                item,
-                error,
+        if not isinstance(data, list):
+            raise ValueError(
+                "JSON input must contain an array of event objects"
             )
 
-    logger.info("Valid records: %s", len(valid_events))
-    logger.info("Invalid records: %s", invalid)
-
-    # 3. Remove duplicates
-    unique_events, duplicates = remove_duplicates(valid_events)
-
-    logger.info("Duplicates: %s", duplicates)
-
-    # 4. Store cleaned events in SQLite
-    connection = create_database(database_path)
-    insert_events(connection, unique_events)
-
-    # 5. Calculate analytics
-    report = {
-        "records_received": records_received,
-        "valid": len(valid_events),
-        "invalid": invalid,
-        "duplicates": duplicates,
-        "total_events": get_total_events(connection),
-        "unique_users": get_unique_users(connection),
-        "total_purchases": get_total_purchases(connection),
-        "events_by_type": get_events_by_type(connection),
-        "events_by_source": get_events_by_source(connection),
-        "top_active_users": get_top_active_users(connection),
-        "hourly_activity": get_hourly_activity(connection),
-    }
-
-    # 6. Calculate processing time
-    processing_time = time.perf_counter() - start_time
-
-    report["processing_time_seconds"] = round(
-        processing_time,
-        4,
+        for row in data:
+            if not isinstance(row, dict):
+                raise TypeError(
+                    "Every JSON array item must be an event object"
     )
+            yield row
 
-    logger.info(
-        "Processing time: %s seconds",
-        report["processing_time_seconds"],
-    )
+    else:
+        raise ValueError("Unsupported file format. Use CSV or JSON.")
 
-    # 7. Save report
-    save_report(report, output_path)
-    save_csv_report(report, csv_output_path)
 
-    logger.info(
-       "JSON report generated: %s",
-        output_path,
-)
+def main() -> None:
+    if len(sys.argv) != 2:
+        raise SystemExit(
+            "Usage: uv run python -m event_pipeline.main <input.csv|input.json>"
+        )
 
-    logger.info(
-    "CSV report generated: %s",
-    csv_output_path,
-)
+    input_path = Path(sys.argv[1])
 
-    connection.close()
+    if not input_path.is_file():
+        raise SystemExit(f"Input file not found: {input_path}")
 
-    # 8. Display summary
-    print("\nProcessing completed!")
-    print("--------------------------------")
-    print(f"Records received : {records_received}")
-    print(f"Valid records    : {len(valid_events)}")
-    print(f"Invalid records  : {invalid}")
-    print(f"Duplicates       : {duplicates}")
-    print(f"Unique users     : {report['unique_users']}")
-    print(f"Total purchases  : {report['total_purchases']}")
-    print(f"Processing time  : {report['processing_time_seconds']} seconds")
+    logger = setup_logger()
+    start = time.perf_counter()
+
+    output_dir = Path("data/output")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    invalid_path = output_dir / "invalid_records.csv"
+    db_path = Path("data/events.db")
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    connection = sqlite3.connect(db_path)
+
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        connection.execute("PRAGMA temp_store=FILE")
+        connection.execute("PRAGMA cache_size=-64000")
+
+        # Start with a fresh database table for each run.
+        connection.execute("DROP TABLE IF EXISTS events")
+        connection.execute(
+            """
+            CREATE TABLE events (
+                event_id TEXT PRIMARY KEY,
+                event_time TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                product_id INTEGER NOT NULL,
+                category_id INTEGER NOT NULL,
+                category_code TEXT,
+                brand TEXT,
+                price TEXT NOT NULL,
+                user_id INTEGER NOT NULL,
+                user_session TEXT NOT NULL
+            )
+            """
+        )
+        connection.commit()
+
+        received = 0
+        valid = 0
+        invalid = 0
+        duplicates = 0
+
+        with invalid_path.open(
+            "w", encoding="utf-8", newline=""
+        ) as invalid_file:
+            invalid_writer = csv.writer(invalid_file)
+            invalid_writer.writerow(["row_data", "error"])
+
+            batch = []
+
+            for row in read_events(input_path):
+                received += 1
+
+                if received % 100_000 == 0:
+                    logger.info("Processed %s records...", received)
+
+                # The Kaggle dataset does not provide event_id.
+                row_with_id = {
+                    **row,
+                    "event_id": generate_event_id(row),
+                }
+
+                event, error = validate_event(row_with_id)
+
+                if error:
+                    invalid += 1
+                    invalid_writer.writerow(
+                        [
+                            json.dumps(row, ensure_ascii=False),
+                            error,
+                        ]
+                    )
+                    continue
+
+                valid += 1
+
+                batch.append(
+                    (
+                        event.event_id,
+                        event.event_time.isoformat(),
+                        event.event_type,
+                        event.product_id,
+                        event.category_id,
+                        event.category_code,
+                        event.brand,
+                        str(event.price),
+                        event.user_id,
+                        event.user_session,
+                    )
+                )
+
+                if len(batch) >= BATCH_SIZE:
+                    before = connection.total_changes
+
+                    connection.executemany(
+                        """
+                        INSERT OR IGNORE INTO events VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        batch,
+                    )
+
+                    inserted = connection.total_changes - before
+                    duplicates += len(batch) - inserted
+                    connection.commit()
+                    batch.clear()
+
+            if batch:
+                before = connection.total_changes
+
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO events VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
+                    """,
+                    batch,
+                )
+
+                inserted = connection.total_changes - before
+                duplicates += len(batch) - inserted
+                connection.commit()
+
+        total_events = connection.execute(
+            "SELECT COUNT(*) FROM events"
+        ).fetchone()[0]
+
+        unique_users = connection.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM events"
+        ).fetchone()[0]
+
+        total_purchases = connection.execute(
+            """
+            SELECT COUNT(*) FROM events
+            WHERE event_type = 'purchase'
+            """
+        ).fetchone()[0]
+
+        revenue = connection.execute(
+            """
+            SELECT COALESCE(SUM(CAST(price AS REAL)), 0)
+            FROM events
+            WHERE event_type = 'purchase'
+            """
+        ).fetchone()[0]
+
+        events_by_type = dict(
+            connection.execute(
+                """
+                SELECT event_type, COUNT(*)
+                FROM events
+                GROUP BY event_type
+                ORDER BY event_type
+                """
+            ).fetchall()
+        )
+
+        # This is an e-commerce dataset, so brand analytics are useful.
+        top_brands = [
+            {"brand": brand or "unknown", "event_count": count}
+            for brand, count in connection.execute(
+                """
+                SELECT brand, COUNT(*)
+                FROM events
+                GROUP BY brand
+                ORDER BY COUNT(*) DESC
+                LIMIT 10
+                """
+            ).fetchall()
+        ]
+
+        top_users = [
+            {"user_id": user_id, "event_count": count}
+            for user_id, count in connection.execute(
+                """
+                SELECT user_id, COUNT(*)
+                FROM events
+                GROUP BY user_id
+                ORDER BY COUNT(*) DESC, user_id
+                LIMIT 10
+                """
+            ).fetchall()
+        ]
+
+        hourly_activity = [
+            {"hour": hour, "event_count": count}
+            for hour, count in connection.execute(
+                """
+                SELECT substr(event_time, 12, 2), COUNT(*)
+                FROM events
+                GROUP BY 1
+                ORDER BY 1
+                """
+            ).fetchall()
+        ]
+
+        report = {
+            "input_file": input_path.name,
+            "records_received": received,
+            "valid": valid,
+            "invalid": invalid,
+            "duplicates": duplicates,
+            "total_events": total_events,
+            "unique_users": unique_users,
+            "total_purchases": total_purchases,
+            "estimated_purchase_value": round(revenue, 2),
+            "events_by_type": events_by_type,
+            "top_brands": top_brands,
+            "top_active_users": top_users,
+            "hourly_activity": hourly_activity,
+            "processing_time_seconds": round(
+                time.perf_counter() - start, 4
+            ),
+        }
+
+        save_report(report, output_dir / "report.json")
+        save_csv_report(report, output_dir / "report.csv")
+
+        logger.info("Records received: %s", received)
+        logger.info("Valid records: %s", valid)
+        logger.info("Invalid records: %s", invalid)
+        logger.info("Duplicates: %s", duplicates)
+        logger.info("Unique users: %s", unique_users)
+        logger.info("Total purchases: %s", total_purchases)
+        logger.info(
+            "Processing time: %s seconds",
+            report["processing_time_seconds"],
+        )
+
+        print("\nProcessing completed!")
+        print("-----------------------------")
+        print(f"Records received : {received}")
+        print(f"Valid records    : {valid}")
+        print(f"Invalid records  : {invalid}")
+        print(f"Duplicates       : {duplicates}")
+        print(f"Unique users     : {unique_users}")
+        print(f"Total purchases  : {total_purchases}")
+        print(
+            f"Processing time  : "
+            f"{report['processing_time_seconds']} seconds"
+        )
+        print("Reports saved in data/output/")
+        print(f"Invalid rows saved to {invalid_path}")
+
+    except Exception:
+        logger.exception("Pipeline failed")
+        raise
+    finally:
+        connection.close()
+
 
 if __name__ == "__main__":
     main()

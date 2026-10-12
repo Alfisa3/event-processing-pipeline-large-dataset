@@ -1,5 +1,10 @@
+
 .venv/
 __pycache__/
 *.pyc
 *.db
 data/logs/
+.pytest_cache/
+.ruff_cache/
+data/output/
+data/input/
